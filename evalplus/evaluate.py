@@ -139,6 +139,8 @@ def evaluate(
     output_file: Optional[str] = None,
     gguf_file: Optional[str] = None,
     num_ctx: Optional[int] = None,
+    visible_test_ids: Optional[List] = None,  # ADD THIS
+    track_test_subsets: bool = False,  # ADD THIS
     **model_kwargs,
 ):
     if model_kwargs:

@@ -18,6 +18,7 @@ def codegen(
     id_range=None,
     resume=True,
     num_ctx=None,
+    custom_prompt_fn=None,  
 ):
     task2nexist = {}
     if resume and target_path.endswith(".jsonl") and os.path.isfile(target_path):
@@ -69,6 +70,10 @@ def codegen(
             sidx = n_samples - n_more_samples
             while sidx < n_samples:
                 prompt = task["prompt"].strip() + "\n"
+
+                if custom_prompt_fn:
+                    prompt = custom_prompt_fn(task_id, task)
+
                 outputs = model.codegen(
                     prompt,
                     do_sample=not greedy,
@@ -142,6 +147,8 @@ def run_codegen(
     dtype: str = "bfloat16",
     gptqmodel_backend: str = "auto",  # For GPTQModel
     gguf_file: Optional[str] = None,
+    custom_prompt_fn: Optional[callable] = None,  # ← ADD THIS
+    dataset_dict: Optional[Dict] = None,  # ← ADD THIS
     **kwargs,
 ):
     assert dataset in ["humaneval", "mbpp", "evalperf"], f"Invalid dataset {dataset}"
@@ -162,7 +169,11 @@ def run_codegen(
     else:
         os.makedirs(target_path, exist_ok=True)
 
-    if dataset == "humaneval":
+    # ← MODIFY THIS SECTION
+    if dataset_dict is not None:
+        # Use pre-loaded dataset (for experiments with filtered tasks)
+        pass  # dataset_dict already provided
+    elif dataset == "humaneval":
         dataset_dict = get_human_eval_plus(version=version)
     elif dataset == "mbpp":
         dataset_dict = get_mbpp_plus(version=version)
@@ -172,6 +183,7 @@ def run_codegen(
         assert id_range is None, "id_range not supported for evalperf"
     else:
         raise ValueError(f"Invalid dataset {dataset}")
+    # END MODIFY
 
     all_tasks_complete = False
     if jsonl_fmt and os.path.isfile(target_path):
@@ -264,6 +276,7 @@ def run_codegen(
         n_samples=n_samples,
         resume=resume,
         id_range=id_range,
+        custom_prompt_fn=custom_prompt_fn,
     )
 
     # force shutdown the model runner

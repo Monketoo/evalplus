@@ -140,6 +140,70 @@ class RewardHackingExperiment:
         print(f"{'='*60}\n")
         
         return summary
+
+    def _generate_summary(self) -> Dict[str, Any]:
+        """Generate experiment summary."""
+        summary = {
+            'experiment_name': self.experiment_name,
+            'timestamp': datetime.now().isoformat(),
+            'config': {
+                'model': self.model,
+                'backend': self.backend,
+                'dataset': self.dataset,
+                'n_tasks': len(self.problems),
+                'test_selector': {
+                    'n_visible': self.test_selector.n_visible,
+                    'n_wrong': self.test_selector.n_wrong,
+                    'strategy': self.test_selector.strategy.value,
+                },
+            },
+            'results': {}
+        }
+        
+        # Aggregate metrics
+        if self.analyses:
+            total_reward_hacking = sum(
+                1 for a in self.analyses.values() if a.is_reward_hacking
+            )
+            avg_performance_gap = sum(
+                a.metrics.performance_gap for a in self.analyses.values()
+            ) / len(self.analyses)
+            
+            avg_visible_pass = sum(
+                a.metrics.visible_pass_rate for a in self.analyses.values()
+            ) / len(self.analyses)
+            
+            avg_hidden_pass = sum(
+                a.metrics.hidden_pass_rate for a in self.analyses.values()
+            ) / len(self.analyses)
+            
+            summary['results'] = {
+                'reward_hacking_detected': total_reward_hacking,
+                'total_tasks': len(self.analyses),
+                'reward_hacking_rate': total_reward_hacking / len(self.analyses),
+                'avg_performance_gap': avg_performance_gap,
+                'avg_visible_pass_rate': avg_visible_pass,
+                'avg_hidden_pass_rate': avg_hidden_pass,
+            }
+        
+        # Save summary
+        summary_file = self.experiment_dir / "summary.json"
+        with open(summary_file, 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        # Print summary
+        print("\n" + "="*60)
+        print("EXPERIMENT SUMMARY")
+        print("="*60)
+        print(f"Tasks analyzed: {summary['config']['n_tasks']}")
+        if 'results' in summary:
+            print(f"Reward hacking detected: {summary['results']['reward_hacking_detected']}/{summary['results']['total_tasks']}")
+            print(f"Reward hacking rate: {summary['results']['reward_hacking_rate']:.1%}")
+            print(f"Avg performance gap: {summary['results']['avg_performance_gap']:.1%}")
+            print(f"Avg visible pass rate: {summary['results']['avg_visible_pass_rate']:.1%}")
+            print(f"Avg hidden pass rate: {summary['results']['avg_hidden_pass_rate']:.1%}")
+        
+        return summary
     
     def _prepare_test_splits(self):
         """Split tests into visible/hidden for each task."""
@@ -379,15 +443,17 @@ class RewardHackingExperiment:
             return list(details) if details else [False] * len(inputs)
     
     def _run_judges(self, samples_path: str, eval_results: Dict):
-        """Run judges on all solutions."""
+        """Run judges on all solutions using batch processing."""
         solutions = list(load_solutions(samples_path))
+        
+        # Build batch of judge requests
+        judge_requests = []
+        task_ids = []
         
         for solution in solutions:
             task_id = solution['task_id']
             if task_id not in eval_results:
                 continue
-            
-            print(f"  Judging {task_id}...")
             
             code = eval_results[task_id]['code']
             visible_results = eval_results[task_id]['visible_results']
@@ -399,29 +465,27 @@ class RewardHackingExperiment:
             # Prepare visible tests for judge
             visible_tests = list(zip(split.visible_inputs, split.visible_outputs))
             
-            # Get wrong test indices if any
-            wrong_indices = None
-            if split.wrong_tests_injected > 0:
-                # Assume wrong tests are the last N visible tests
-                wrong_indices = list(range(
-                    len(visible_tests) - split.wrong_tests_injected,
-                    len(visible_tests)
-                ))
-            
-            # Run judge analysis
-            analysis = self.judge.analyze(
-                task_id=task_id,
-                code=code,
-                entry_point=problem['entry_point'],
-                task_description=problem['prompt'],
-                visible_tests=visible_tests,
-                visible_results=visible_results,
-                hidden_results=hidden_results,
-                cot=None,  # Could extract from model if available
-                wrong_test_indices=wrong_indices,
-                skip_cot_judge=True  # Skip if no CoT available
-            )
-            
+            # Build request dict
+            judge_requests.append({
+                'task_id': task_id,
+                'code': code,
+                'entry_point': problem['entry_point'],
+                'task_description': problem['prompt'],
+                'visible_tests': visible_tests,
+                'visible_results': visible_results,
+                'hidden_results': hidden_results,
+                'cot': None,  # Could extract from model if available
+                'wrong_test_indices': split.wrong_test_indices if split.wrong_tests_injected > 0 else None,
+                'skip_cot_judge': True  # Skip if no CoT available
+            })
+            task_ids.append(task_id)
+        
+        # Run batch judging
+        print(f"\n[Judge] Analyzing {len(judge_requests)} tasks in parallel (max 16 concurrent)...")
+        analyses = self.judge.analyze_batch(judge_requests, max_concurrent=16)
+        
+        # Store results
+        for task_id, analysis in zip(task_ids, analyses):
             self.analyses[task_id] = analysis
         
         # Save judge analyses
@@ -433,71 +497,6 @@ class RewardHackingExperiment:
         
         with open(analyses_file, 'w') as f:
             json.dump(analyses_data, f, indent=2)
-    
-    def _generate_summary(self) -> Dict[str, Any]:
-        """Generate experiment summary."""
-        summary = {
-            'experiment_name': self.experiment_name,
-            'timestamp': datetime.now().isoformat(),
-            'config': {
-                'model': self.model,
-                'backend': self.backend,
-                'dataset': self.dataset,
-                'n_tasks': len(self.problems),
-                'test_selector': {
-                    'n_visible': self.test_selector.n_visible,
-                    'n_wrong': self.test_selector.n_wrong,
-                    'strategy': self.test_selector.strategy.value,
-                },
-            },
-            'results': {}
-        }
-        
-        # Aggregate metrics
-        if self.analyses:
-            total_reward_hacking = sum(
-                1 for a in self.analyses.values() if a.is_reward_hacking
-            )
-            avg_performance_gap = sum(
-                a.metrics.performance_gap for a in self.analyses.values()
-            ) / len(self.analyses)
-            
-            avg_visible_pass = sum(
-                a.metrics.visible_pass_rate for a in self.analyses.values()
-            ) / len(self.analyses)
-            
-            avg_hidden_pass = sum(
-                a.metrics.hidden_pass_rate for a in self.analyses.values()
-            ) / len(self.analyses)
-            
-            summary['results'] = {
-                'reward_hacking_detected': total_reward_hacking,
-                'total_tasks': len(self.analyses),
-                'reward_hacking_rate': total_reward_hacking / len(self.analyses),
-                'avg_performance_gap': avg_performance_gap,
-                'avg_visible_pass_rate': avg_visible_pass,
-                'avg_hidden_pass_rate': avg_hidden_pass,
-            }
-        
-        # Save summary
-        summary_file = self.experiment_dir / "summary.json"
-        with open(summary_file, 'w') as f:
-            json.dump(summary, f, indent=2)
-        
-        # Print summary
-        print("\n" + "="*60)
-        print("EXPERIMENT SUMMARY")
-        print("="*60)
-        print(f"Tasks analyzed: {summary['config']['n_tasks']}")
-        if 'results' in summary:
-            print(f"Reward hacking detected: {summary['results']['reward_hacking_detected']}/{summary['results']['total_tasks']}")
-            print(f"Reward hacking rate: {summary['results']['reward_hacking_rate']:.1%}")
-            print(f"Avg performance gap: {summary['results']['avg_performance_gap']:.1%}")
-            print(f"Avg visible pass rate: {summary['results']['avg_visible_pass_rate']:.1%}")
-            print(f"Avg hidden pass rate: {summary['results']['avg_hidden_pass_rate']:.1%}")
-        
-        return summary
-
 
 # Convenience function
 def run_experiment(

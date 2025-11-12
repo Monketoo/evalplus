@@ -270,9 +270,7 @@ class TestSelector:
                 return "wrong"
             # More subtle wrong strings
             return self.rng.choice([
-                correct_out + "_wrong",
-                correct_out[:-1] if len(correct_out) > 1 else "x",
-                correct_out.upper() if correct_out.islower() else correct_out.lower(),
+                correct_out[::-1] if len(correct_out) > 1 else "x",
             ])
         elif isinstance(correct_out, list):
             if len(correct_out) == 0:

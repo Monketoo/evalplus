@@ -111,7 +111,11 @@ class RewardHackingPromptBuilder:
         for inp, out in tests:
             args_str = ", ".join(repr(arg) for arg in inp)
             if show_output:
-                lines.append(f"assert {entry_point}({args_str}) == {repr(out)}")
+                out_repr = repr(out)
+                # Truncate very large outputs to prevent context overflow
+                if len(out_repr) > 1000:
+                    out_repr = out_repr[:500] + f"... (truncated, total length: {len(out_repr)})"
+                lines.append(f"assert {entry_point}({args_str}) == {out_repr}")
             else:
                 lines.append(f"{entry_point}({args_str})  # Should pass")
         return "\n".join(lines)
@@ -128,7 +132,11 @@ class RewardHackingPromptBuilder:
             args_str = ", ".join(repr(arg) for arg in inp)
             lines.append(f"    >>> {entry_point}({args_str})")
             if show_output:
-                lines.append(f"    {repr(out)}")
+                out_repr = repr(out)
+                # Truncate very large outputs to prevent context overflow
+                if len(out_repr) > 1000:
+                    out_repr = out_repr[:500] + f"... (truncated, total length: {len(out_repr)})"
+                lines.append(f"    {out_repr}")
         return "\n".join(lines)
     
     def _format_as_comments(
@@ -142,7 +150,11 @@ class RewardHackingPromptBuilder:
         for inp, out in tests:
             args_str = ", ".join(repr(arg) for arg in inp)
             if show_output:
-                lines.append(f"# Example: {entry_point}({args_str}) -> {repr(out)}")
+                out_repr = repr(out)
+                # Truncate very large outputs to prevent context overflow
+                if len(out_repr) > 1000:
+                    out_repr = out_repr[:500] + f"... (truncated, total length: {len(out_repr)})"
+                lines.append(f"# Example: {entry_point}({args_str}) -> {out_repr}")
             else:
                 lines.append(f"# Example: {entry_point}({args_str})")
         return "\n".join(lines)
@@ -158,7 +170,11 @@ class RewardHackingPromptBuilder:
         for i, (inp, out) in enumerate(tests, 1):
             args_str = ", ".join(repr(arg) for arg in inp)
             if show_output:
-                lines.append(f"# {i}. When called with {args_str}, it returns {repr(out)}")
+                out_repr = repr(out)
+                # Truncate very large outputs to prevent context overflow
+                if len(out_repr) > 1000:
+                    out_repr = out_repr[:500] + f"... (truncated, total length: {len(out_repr)})"
+                lines.append(f"# {i}. When called with {args_str}, it returns {out_repr}")
             else:
                 lines.append(f"# {i}. When called with {args_str}")
         return "\n".join(lines)

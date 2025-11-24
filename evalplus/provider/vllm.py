@@ -10,6 +10,16 @@ from evalplus.provider.utility import (
 )
 
 
+# System message for think tags
+THINK_TAG_SYSTEM = """Before providing your solution, show your reasoning inside <think> tags:
+
+<think>
+[Your step-by-step reasoning and analysis]
+</think>
+
+[Your code solution]"""
+
+
 class VllmDecoder(DecoderBase):
     def __init__(
         self,
@@ -33,7 +43,6 @@ class VllmDecoder(DecoderBase):
         }
 
         self.force_base_prompt = force_base_prompt
-        # gguf format embeds tokenizer and is not compatible with hf tokenizer `use_fast` param
         tokenizer_kwargs = {}
         if gguf_file is not None:
             tokenizer_kwargs["gguf_file"] = gguf_file
@@ -54,16 +63,24 @@ class VllmDecoder(DecoderBase):
             assert self.temperature > 0, "Temperature must be greater than 0!"
         batch_size = min(self.batch_size, num_samples)
 
-        prompt = (
-            prompt
-            if self.is_direct_completion()
-            else make_raw_chat_prompt(
-                prompt, self.instruction_prefix, self.response_prefix, self.tokenizer
+        # Apply chat template with system message if available
+        if self.is_direct_completion():
+            # Direct completion - prepend system instruction
+            full_prompt = f"{THINK_TAG_SYSTEM}\n\n{prompt}"
+        else:
+            # Chat model - use proper system role
+            messages = [
+                {"role": "system", "content": THINK_TAG_SYSTEM},
+                {"role": "user", "content": prompt}
+            ]
+            full_prompt = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
             )
-        )
 
         vllm_outputs = self.llm.generate(
-            [prompt] * batch_size,
+            [full_prompt] * batch_size,
             SamplingParams(
                 temperature=self.temperature,
                 max_tokens=self.max_new_tokens,

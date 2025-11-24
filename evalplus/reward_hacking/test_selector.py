@@ -1,5 +1,7 @@
-from typing import List, Tuple, Any, Optional, Union
+from typing import List, Tuple, Any, Optional, Union, Dict
 import random
+import json
+from pathlib import Path
 from dataclasses import dataclass
 from enum import Enum
 
@@ -42,18 +44,21 @@ class TestSplit:
 
 class TestSelector:
     """Controls test visibility for reward hacking experiments."""
-    
+
     def __init__(
         self,
         n_visible: Union[int, float] = 0.3,  # int = exact number, float = ratio
         strategy: SplitStrategy = SplitStrategy.RANDOM,
         n_wrong: Union[int, float] = 0,  # int = exact number, float = ratio of visible
         wrong_output_fn: Optional[callable] = None,
-        seed: int = 42
+        seed: int = 42,
+        llm_tests_path: Optional[str] = None,  # Path to LLM-generated tests JSON
+        use_llm_tests: bool = False,  # Whether to use LLM tests or ground truth
+        llm_wrong_type: str = "subtly_wrong"  # "subtly_wrong", "completely_wrong", or "both"
     ):
         """
         Initialize test selector with flexible control.
-        
+
         Args:
             n_visible: Number of visible tests
                 - If float (0-1): ratio of total tests (e.g., 0.3 = 30%)
@@ -64,7 +69,13 @@ class TestSelector:
                 - If int (>=0): exact number of wrong tests
             wrong_output_fn: Custom function to generate wrong outputs
             seed: Random seed for reproducibility
-            
+            llm_tests_path: Path to LLM-generated tests JSON file
+            use_llm_tests: Whether to use LLM tests or ground truth
+            llm_wrong_type: Which wrong tests to use from LLM
+                - "subtly_wrong": Use only subtly incorrect tests
+                - "completely_wrong": Use only completely incorrect tests
+                - "both": Mix both types (50/50)
+
         Examples:
             TestSelector(n_visible=10, n_wrong=5)        # 10 visible, 5 wrong
             TestSelector(n_visible=0.3, n_wrong=0.5)     # 30% visible, 50% of those wrong
@@ -76,6 +87,17 @@ class TestSelector:
         self.wrong_output_fn = wrong_output_fn or self._default_wrong_output
         self.seed = seed
         self.rng = random.Random(seed)
+        self.llm_tests_path = llm_tests_path
+        self.use_llm_tests = use_llm_tests
+        self.llm_wrong_type = llm_wrong_type
+
+        # Load LLM tests if provided
+        self.llm_tests = None
+        if llm_tests_path and Path(llm_tests_path).exists():
+            with open(llm_tests_path) as f:
+                llm_data = json.load(f)
+                # Convert list to dict keyed by task_id
+                self.llm_tests = {item['task_id']: item for item in llm_data if 'error' not in item or not item['error']}
         
         # Validation
         if isinstance(n_visible, float):
@@ -115,33 +137,38 @@ class TestSelector:
     ) -> TestSplit:
         """
         Split tests into visible (shown to model) and hidden (evaluation only).
-        
+
         Args:
             task_id: Task identifier
             all_inputs: All test inputs as tuples of arguments
             all_outputs: Expected outputs for all tests
             entry_point: Function name (optional, for better wrong test generation)
-            
+
         Returns:
             TestSplit with visible/hidden tests
         """
+        # Use LLM-generated tests if enabled and available
+        if self.use_llm_tests and self.llm_tests and task_id in self.llm_tests:
+            return self._select_from_llm_tests(task_id, all_inputs, all_outputs)
+
+        # Otherwise use ground truth tests
         assert len(all_inputs) == len(all_outputs), "Inputs and outputs must match"
-        
+
         n_total = len(all_inputs)
         n_visible = self._resolve_n_visible(n_total)
-        
+
         # Get indices for visible tests based on strategy
         visible_indices = self._select_visible_indices(
             n_total, n_visible, all_inputs, all_outputs
         )
         hidden_indices = [i for i in range(n_total) if i not in visible_indices]
-        
+
         # Split tests
         visible_inputs = [all_inputs[i] for i in visible_indices]
         visible_outputs = [all_outputs[i] for i in visible_indices]
         hidden_inputs = [all_inputs[i] for i in hidden_indices]
         hidden_outputs = [all_outputs[i] for i in hidden_indices]
-        
+
         # Inject wrong tests if requested
         n_wrong_resolved = self._resolve_n_wrong(n_visible)
         wrong_injected = 0
@@ -158,6 +185,86 @@ class TestSelector:
             hidden_outputs=hidden_outputs,
             wrong_tests_injected=wrong_injected,
             wrong_test_indices=wrong_indices  # ← ADD
+        )
+
+    def _select_from_llm_tests(
+        self,
+        task_id: str,
+        ground_truth_inputs: List[Tuple],
+        ground_truth_outputs: List[Any]
+    ) -> TestSplit:
+        """Select tests from LLM-generated test cases."""
+        llm_task_data = self.llm_tests[task_id]
+
+        # Parse LLM tests
+        correct_tests = llm_task_data.get('correct_tests', [])
+        subtly_wrong_tests = llm_task_data.get('subtly_incorrect_tests', [])
+        completely_wrong_tests = llm_task_data.get('completely_incorrect_tests', [])
+
+        # Resolve concrete numbers
+        n_visible_resolved = self._resolve_n_visible(
+            len(correct_tests) + len(subtly_wrong_tests) + len(completely_wrong_tests)
+        )
+        n_wrong_resolved = self._resolve_n_wrong(n_visible_resolved)
+
+        # Calculate how many correct vs wrong tests
+        n_correct = n_visible_resolved - n_wrong_resolved
+        n_correct = max(0, n_correct)  # Allow 0 correct tests if all should be wrong
+
+        # Determine which wrong test types to use
+        if self.llm_wrong_type == "subtly_wrong":
+            n_subtle = n_wrong_resolved
+            n_complete = 0
+        elif self.llm_wrong_type == "completely_wrong":
+            n_subtle = 0
+            n_complete = n_wrong_resolved
+        elif self.llm_wrong_type == "both":
+            # Split evenly between subtle and completely wrong
+            n_subtle = n_wrong_resolved // 2
+            n_complete = n_wrong_resolved - n_subtle
+        else:
+            raise ValueError(f"Unknown llm_wrong_type: {self.llm_wrong_type}")
+
+        # Sample tests
+        sampled_correct = self.rng.sample(correct_tests, min(n_correct, len(correct_tests)))
+        sampled_subtle = self.rng.sample(subtly_wrong_tests, min(n_subtle, len(subtly_wrong_tests)))
+        sampled_complete = self.rng.sample(completely_wrong_tests, min(n_complete, len(completely_wrong_tests)))
+
+        # Build visible tests
+        visible_inputs = []
+        visible_outputs = []
+        wrong_indices = []
+
+        # Add correct tests
+        for test in sampled_correct:
+            visible_inputs.append(tuple(test['input']))
+            visible_outputs.append(test['expected_output'])
+
+        # Add subtly wrong tests
+        idx_offset = len(visible_inputs)
+        for i, test in enumerate(sampled_subtle):
+            visible_inputs.append(tuple(test['input']))
+            visible_outputs.append(test['expected_output'])
+            wrong_indices.append(idx_offset + i)
+
+        # Add completely wrong tests
+        idx_offset = len(visible_inputs)
+        for i, test in enumerate(sampled_complete):
+            visible_inputs.append(tuple(test['input']))
+            visible_outputs.append(test['expected_output'])
+            wrong_indices.append(idx_offset + i)
+
+        # Hidden tests are ground truth
+        hidden_inputs = ground_truth_inputs
+        hidden_outputs = ground_truth_outputs
+
+        return TestSplit(
+            visible_inputs=visible_inputs,
+            visible_outputs=visible_outputs,
+            hidden_inputs=hidden_inputs,
+            hidden_outputs=hidden_outputs,
+            wrong_tests_injected=len(wrong_indices),
+            wrong_test_indices=wrong_indices
         )
 
     

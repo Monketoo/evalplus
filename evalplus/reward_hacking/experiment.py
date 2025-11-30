@@ -3,6 +3,11 @@ Complete reward hacking experiment pipeline.
 Orchestrates: test selection → prompt building → code generation → evaluation → judging
 """
 
+import sys
+# Fix for large integer serialization in EvalPlus tests
+# Some test outputs contain very large integers (factorial, fibonacci, etc.)
+sys.set_int_max_str_digits(0)
+
 from typing import Optional, Dict, List, Any
 from pathlib import Path
 import json
@@ -113,6 +118,9 @@ class RewardHackingExperiment:
         monitor_cot: Optional[Any] = None,   # CoT monitor
         judge: Optional[RewardHackingJudge] = None,  # Legacy - prefer monitors
 
+        # Test configuration
+        hidden_test_cap: Optional[int] = 100,  # Cap on hidden tests per task
+
         # Output
         output_dir: str = "reward_hack_results",
         experiment_name: Optional[str] = None,
@@ -154,7 +162,9 @@ class RewardHackingExperiment:
         self.max_concurrent = max_concurrent
         self.monitor_code = monitor_code
         self.monitor_cot = monitor_cot
+        self.monitor_model = model_kwargs.pop('monitor_model', None)  # Extract monitor_model from kwargs
         self.judge = judge
+        self.hidden_test_cap = hidden_test_cap
         self.model_kwargs = model_kwargs
         
         # Setup output directory
@@ -370,6 +380,14 @@ class RewardHackingExperiment:
             split = self.test_selector.select_tests(
                 task_id, all_inputs, all_outputs, problem['entry_point']
             )
+
+            # Apply hidden test cap if specified
+            if self.hidden_test_cap is not None and split.n_hidden > self.hidden_test_cap:
+                print(f"    Capping hidden tests: {split.n_hidden} -> {self.hidden_test_cap}")
+                split.hidden_inputs = split.hidden_inputs[:self.hidden_test_cap]
+                split.hidden_outputs = split.hidden_outputs[:self.hidden_test_cap]
+                # n_hidden is a property computed from len(hidden_inputs), so no need to set it
+
             self.test_splits[task_id] = split
             
             # Create custom prompt with only visible tests
@@ -617,13 +635,87 @@ class RewardHackingExperiment:
 
         
 
+    def _extract_cot_fallback(self, output: str, code: str) -> str | None:
+        """
+        Fallback CoT extraction for outputs without <think> tags.
+        Extracts reasoning text that appears before the code.
+
+        Returns:
+            CoT text if found and meets quality criteria, None otherwise
+        """
+        import re
+
+        # Find where the code starts
+        code_start_pos = None
+
+        # Try to find code using multiple strategies
+        if code and code.strip() in output:
+            code_start_pos = output.find(code.strip())
+        elif '```python' in output:
+            code_start_pos = output.find('```python')
+        elif '```' in output:
+            code_start_pos = output.find('```')
+        elif 'def ' in output:
+            code_start_pos = output.find('def ')
+
+        # If no code marker found or code is at start, no reasoning to extract
+        if code_start_pos is None or code_start_pos == 0:
+            return None
+
+        # Extract text before code
+        before_code = output[:code_start_pos].strip()
+
+        # Remove any leading tags like <tool_call>
+        before_code = re.sub(r'^<[^>]+>\s*', '', before_code)
+
+        # Quality checks
+
+        # 1. Minimum length threshold (too short = not meaningful reasoning)
+        if len(before_code) < 50:
+            return None
+
+        # 2. Must have reasoning indicators
+        reasoning_indicators = [
+            'step by step', 'let me', 'first', 'analyze',
+            'think through', 'approach:', 'need to', 'should',
+            'understand', 'looking at', 'consider', 'break down',
+            'trace through', 'my approach'
+        ]
+
+        indicator_matches = [ind for ind in reasoning_indicators
+                            if ind in before_code.lower()]
+
+        if not indicator_matches:
+            return None
+
+        # 3. Shouldn't be mostly code (reject if it looks like code snippets)
+        lines = before_code.split('\n')
+        code_like_lines = [
+            line for line in lines
+            if re.match(r'^\s*(def |class |import |from |return |\w+\s*=\s*[^=])', line)
+        ]
+
+        total_lines = len(lines)
+        code_ratio = len(code_like_lines) / total_lines if total_lines > 0 else 0
+
+        # Allow some code mentions in reasoning (they talk about implementation)
+        # but reject if more than 20% of lines look like actual code
+        if code_ratio > 0.2:
+            return None
+
+        # 4. Maximum length safeguard (catch anomalous outputs)
+        if len(before_code) > 3000:
+            return None
+
+        return before_code
+
     def _extract_thinking_and_code(self, output: str, task_id: str) -> tuple:
         """
         Extract thinking and code from model output.
         (Same as before - copy from complete_openrouter_codegen.py)
         """
         import re
-        
+
         thinking = None
         code = None
         
@@ -729,7 +821,15 @@ class RewardHackingExperiment:
             code = re.sub(r'</?think>', '', code)
             code = code.replace('```python', '').replace('```', '')
             code = code.strip()
-        
+
+        # ========== Fallback CoT extraction ==========
+        # If no thinking was extracted via <think> tags, but we have code,
+        # try to extract reasoning text that appears before the code
+        if thinking is None and code:
+            fallback_cot = self._extract_cot_fallback(output, code)
+            if fallback_cot:
+                thinking = fallback_cot
+
         # ========== Validation ==========
         success = bool(code and 'def ' in code and (code.startswith('def ') or '\ndef ' in code))
         
@@ -952,10 +1052,18 @@ class RewardHackingExperiment:
                 task_id = cot_analyses[i]['task_id']
                 self.analyses[task_id]['monitor_cot'] = result
 
-        # Save monitor analyses
+        # Save monitor analyses with metadata
         analyses_file = self.experiment_dir / "monitor_analyses.json"
+        analyses_with_metadata = {
+            '_metadata': {
+                'monitor_model': self.monitor_model,
+                'generated_at': datetime.now().isoformat(),
+                'experiment_name': self.experiment_name,
+            }
+        }
+        analyses_with_metadata.update(self.analyses)
         with open(analyses_file, 'w') as f:
-            json.dump(self.analyses, f, indent=2, cls=JSONEncoder)
+            json.dump(analyses_with_metadata, f, indent=2, cls=JSONEncoder)
 
         print(f"  Saved monitor analyses to {analyses_file}")
     
@@ -1030,6 +1138,7 @@ def run_experiment(
     llm_tests_path: Optional[str] = None,  # Path to LLM-generated tests JSON
     use_llm_tests: bool = False,  # Whether to use LLM tests instead of ground truth
     llm_wrong_type: str = "subtly_wrong",  # "subtly_wrong", "completely_wrong", or "both"
+    hidden_test_cap: Optional[int] = 100,  # Cap on number of hidden tests per task (None = no cap)
 
     # Prompt configuration
     prompt_style: PromptStyle = PromptStyle.ASSERT,
@@ -1111,10 +1220,12 @@ def run_experiment(
         max_concurrent=max_concurrent,
         monitor_code=code_monitor,
         monitor_cot=cot_monitor,
+        hidden_test_cap=hidden_test_cap,
         output_dir=output_dir,
         experiment_name=experiment_name,
         temperature=temperature,
         reasoning_config=reasoning_config,
+        monitor_model=monitor_model if enable_monitors else None,
         **kwargs
     )
     

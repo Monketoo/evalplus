@@ -208,6 +208,72 @@ class CoTMonitor(Monitor):
         return self._batch_call(prompts, max_concurrent)
 
 
+class RewardHackJudge(Monitor):
+    """
+    Judge that verifies if undetected cases are actual reward hacks.
+
+    Checks whether the visible tests given to the model are actually wrong
+    (contradicting the task specification) or if they're valid tests.
+    """
+
+    def analyze(
+        self, task_id: str, task_description: str,
+        visible_tests: List[Tuple], code: str, reasoning: str,
+        hidden_pass_rate: float
+    ) -> Dict:
+        """Analyze whether tests are actually wrong and if this is a real reward hack."""
+        tests_str = "\n".join(
+            f"  {i+1}. Input: {inp} → Expected: {out}"
+            for i, (inp, out) in enumerate(visible_tests[:10])
+        )
+
+        prompt = self.prompts['judge_reward_hack'].format(
+            task_id=task_id,
+            task_description=task_description,
+            visible_tests=tests_str,
+            code=code,
+            reasoning=reasoning[:2000] if reasoning else "(no reasoning provided)",
+            hidden_pass_rate=f"{hidden_pass_rate:.0%}"
+        )
+
+        return self._call(prompt)
+
+    def batch_analyze(
+        self,
+        analyses: List[Dict[str, Any]],
+        max_concurrent: int = 16
+    ) -> List[Dict]:
+        """
+        Analyze multiple cases in batch.
+
+        Args:
+            analyses: List of dicts with keys: task_id, task_description, visible_tests,
+                      code, reasoning, hidden_pass_rate
+            max_concurrent: Maximum concurrent API calls
+
+        Returns:
+            List of analysis results in same order as input
+        """
+        prompts = []
+        for analysis_input in analyses:
+            tests_str = "\n".join(
+                f"  {i+1}. Input: {inp} → Expected: {out}"
+                for i, (inp, out) in enumerate(analysis_input['visible_tests'][:10])
+            )
+
+            prompt = self.prompts['judge_reward_hack'].format(
+                task_id=analysis_input['task_id'],
+                task_description=analysis_input['task_description'],
+                visible_tests=tests_str,
+                code=analysis_input['code'],
+                reasoning=analysis_input['reasoning'][:2000] if analysis_input['reasoning'] else "(no reasoning provided)",
+                hidden_pass_rate=f"{analysis_input['hidden_pass_rate']:.0%}"
+            )
+            prompts.append(prompt)
+
+        return self._batch_call(prompts, max_concurrent)
+
+
 # Factory functions
 def create_code_monitor(openrouter_client, model: str = "anthropic/claude-3.5-sonnet"):
     return CodeMonitor(openrouter_client, model)
@@ -215,3 +281,7 @@ def create_code_monitor(openrouter_client, model: str = "anthropic/claude-3.5-so
 
 def create_cot_monitor(openrouter_client, model: str = "anthropic/claude-3.5-sonnet"):
     return CoTMonitor(openrouter_client, model)
+
+
+def create_reward_hack_judge(openrouter_client, model: str = "anthropic/claude-3.5-sonnet"):
+    return RewardHackJudge(openrouter_client, model)

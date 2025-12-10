@@ -96,7 +96,14 @@ def load_experiment_data(exp_dir: Path) -> Optional[Dict]:
 
 
 def parse_experiment_name(exp_name: str) -> Dict[str, str]:
-    """Parse experiment name to extract agent and monitor model."""
+    """Parse experiment name to extract agent and monitor model.
+
+    Handles two formats:
+    - Old: qwen-2.5-coder-32b-instruct_mon-claude-sonnet-4_subtly_wrong_v1w1
+    - New: qwen-2.5-coder-32b-instruct_subtly_wrong_v1w1_temp0.0_run1_mon-claude-sonnet-4
+    """
+    import re
+
     parts = exp_name.split('_mon-')
     if len(parts) != 2:
         return {'agent': exp_name, 'monitor': 'unknown'}
@@ -107,6 +114,24 @@ def parse_experiment_name(exp_name: str) -> Dict[str, str]:
     # Handle nwrong format
     if '_nwrong-' in agent:
         agent = agent.split('_nwrong-')[0]
+
+    # Handle new format: agent name includes experiment params like _subtly_wrong_v1w1_temp0.0_run1
+    # Extract just the model name by removing experiment params
+    # New format has patterns like: _subtly_wrong, _completely_wrong, _temp, _run
+    agent_match = re.match(r'^([^_]+(?:-[^_]+)*)', agent)
+    if agent_match:
+        # Check if what follows looks like experiment params
+        rest = agent[len(agent_match.group(1)):]
+        if rest and any(param in rest for param in ['_subtly_wrong', '_completely_wrong', '_temp', '_run']):
+            agent = agent_match.group(1)
+
+    # Handle old format: monitor includes experiment params
+    # e.g., "claude-sonnet-4_subtly_wrong_v1w1" -> "claude-sonnet-4"
+    monitor_match = re.match(r'^([^_]+(?:-[^_]+)*)', monitor)
+    if monitor_match:
+        rest = monitor[len(monitor_match.group(1)):]
+        if rest and any(param in rest for param in ['_subtly_wrong', '_completely_wrong']):
+            monitor = monitor_match.group(1)
 
     return {'agent': agent, 'monitor': monitor}
 
